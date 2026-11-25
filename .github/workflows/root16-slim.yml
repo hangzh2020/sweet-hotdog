@@ -1,0 +1,113 @@
+name: root16-slim
+
+# Same as root16-tweaked, plus: drops the daemons that can only crash-loop on
+# this hardware (no Bluetooth firmware, no metadata server backend), so launchd
+# stops churning and SpringBoard can finish its first boot.
+#   removed: com.apple.bluetoothd, com.apple.spotlight.IndexAgent,
+#            com.apple.metadata.mds, com.apple.metadata.mds.index
+# Output: sparse image (.simg) zstd-compressed, split into 1.8 GB release assets.
+
+on:
+  workflow_dispatch:
+    inputs:
+      size:
+        description: root image size
+        default: "16G"
+
+permissions:
+  contents: write
+
+jobs:
+  root:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 300
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+                      /opt/hostedtoolcache/CodeQL /usr/local/share/boost || true
+          df -h /
+
+      - name: Install host tools
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq build-essential cmake pkg-config git \
+            libfuse3-dev fuse3 libattr1-dev zlib1g-dev libbz2-dev libssl-dev \
+            hfsprogs rsync zstd curl python3 android-sdk-libsparse-utils
+          sudo modprobe hfsplus
+
+      - name: Build apfs-fuse
+        run: |
+          sudo git clone --depth 1 https://github.com/sgan81/apfs-fuse.git /opt/apfs-fuse
+          sudo git -C /opt/apfs-fuse submodule update --init --recursive
+          sudo cmake -S /opt/apfs-fuse -B /opt/apfs-fuse/build -DCMAKE_BUILD_TYPE=Release
+          sudo cmake --build /opt/apfs-fuse/build -j"$(nproc)"
+          sudo install -m0755 /opt/apfs-fuse/build/apfs-fuse /usr/local/bin/apfs-fuse
+
+      - name: Fetch IPSW members
+        run: |
+          mkdir -p work
+          IPSW="https://updates.cdn-apple.com/2025FallFCS/fullrestores/122-77006/1158E502-D76D-4226-AA06-ED5E30CD1111/iPhone10,3,iPhone10,6_16.7.16_20H392_Restore.ipsw"
+          python3 tools/remotezip.py "$IPSW" "087-86698-044.dmg" work
+          python3 tools/remotezip.py "$IPSW" "087-86593-047.dmg" work
+          python3 tools/remotezip.py "$IPSW" "087-86715-047.dmg" work
+          ls -l work; df -h /
+
+      - name: Build root image
+        run: |
+          sudo bash tools/mkiosroot.sh work/087-86698-044.dmg work/087-86593-047.dmg \
+            work/087-86715-047.dmg "$RUNNER_TEMP/ios16-root.img" "${{ inputs.size }}"
+          df -h /
+
+      - name: Apply sweet-root-tweaks and drop crash-looping daemons
+        run: |
+          sudo mkdir -p /mnt/iosroot
+          sudo mount -t hfsplus -o loop,force "$RUNNER_TEMP/ios16-root.img" /mnt/iosroot
+          sudo python3 tools/sweet-root-tweaks.py /mnt/iosroot
+          sudo python3 - <<'EOF'
+          import plistlib, os, sys
+          p = '/mnt/iosroot/System/Library/xpc/launchd.plist'
+          st = os.stat(p)
+          d = plistlib.load(open(p, 'rb'))
+          drop = {'com.apple.bluetoothd', 'com.apple.spotlight.IndexAgent',
+                  'com.apple.metadata.mds', 'com.apple.metadata.mds.index',
+                  'com.apple.bluetoothuserd'}
+          removed = []
+          for k in list(d.get('LaunchDaemons', {})):
+              lab = d['LaunchDaemons'][k].get('Label', '')
+              if lab in drop:
+                  del d['LaunchDaemons'][k]
+                  removed.append(lab)
+          plistlib.dump(d, open(p, 'wb'), fmt=plistlib.FMT_BINARY)
+          os.chown(p, st.st_uid, st.st_gid); os.chmod(p, st.st_mode & 0o7777)
+          print('removed jobs:', removed if removed else '(none matched)')
+          print('remaining jobs:', len(d.get('LaunchDaemons', {})))
+          EOF
+          sudo umount /mnt/iosroot
+          fsck.hfsplus -f -y "$RUNNER_TEMP/ios16-root.img" | tail -3 || true
+          df -h /
+
+      - name: Convert to sparse and compress
+        run: |
+          img2simg "$RUNNER_TEMP/ios16-root.img" "$RUNNER_TEMP/ios16-root.simg"
+          zstd -T0 -3 --long=27 -f "$RUNNER_TEMP/ios16-root.simg" -o "$RUNNER_TEMP/ios16-root.simg.zst"
+          sha256sum "$RUNNER_TEMP"/ios16-root.simg > "$RUNNER_TEMP/simg.sha256"
+          cd "$RUNNER_TEMP"
+          split -b 1800M -d ios16-root.simg.zst ios16-root.simg.zst.part
+          ls -lh ios16-root.simg.zst.part* simg.sha256
+          sha256sum ios16-root.simg.zst.part* > parts.sha256
+          cat parts.sha256
+
+      - name: Publish as release assets
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TAG="root16s-${{ github.run_number }}"
+          gh release create "$TAG" \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "ios16-root slim $TAG" \
+            --notes "iOS 16 root: sweet-root-tweaks + bluetoothd/spotlight jobs removed." \
+            "$RUNNER_TEMP"/ios16-root.simg.zst.part* "$RUNNER_TEMP"/simg.sha256 "$RUNNER_TEMP"/parts.sha256
+          echo "release: https://github.com/$GITHUB_REPOSITORY/releases/tag/$TAG"
